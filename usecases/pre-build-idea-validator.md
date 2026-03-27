@@ -1,10 +1,10 @@
 # Pre-Build Idea Validator
 
-Before OpenClaw starts building anything new, it automatically checks whether the idea already exists across GitHub, Hacker News, npm, PyPI, and Product Hunt — and adjusts its approach based on what it finds.
+Before OpenClaw starts building anything new, it automatically checks whether the idea already exists across GitHub and Hacker News — and adjusts its approach based on what it finds.
 
 ## What It Does
 
-- Scans 5 real data sources (GitHub, Hacker News, npm, PyPI, Product Hunt) before any code is written
+- Scans real data sources (GitHub, Hacker News) before any code is written
 - Returns a `reality_signal` score (0-100) indicating how crowded the space is
 - Shows top competitors with star counts and descriptions
 - Suggests pivot directions when the space is saturated
@@ -16,49 +16,159 @@ You tell your agent "build me an AI code review tool" and it happily spends 6 ho
 
 ## Skills You Need
 
-- [idea-reality-mcp](https://github.com/mnemox-ai/idea-reality-mcp) — MCP server that scans real data sources and returns a competition score
+- [idea-reality-mcp](https://github.com/mnemox-ai/idea-reality-mcp) — install via pip or uvx
 
 ## How to Set It Up
 
-1. Install idea-reality-mcp:
+### 1. Install idea-reality-mcp
 
 ```bash
-uvx idea-reality-mcp
+uv tool install idea-reality-mcp
 ```
 
-2. Add the MCP server to your OpenClaw config:
+### 2. Create the CLI wrapper at /usr/local/bin/idea-check
 
-```json
-{
-  "mcpServers": {
-    "idea-reality": {
-      "command": "uvx",
-      "args": ["idea-reality-mcp"]
+Save this as `/usr/local/bin/idea-check` and make it executable (`chmod +x`):
+
+```js
+#!/usr/bin/env node
+/**
+ * CLI wrapper for idea-reality-mcp
+ * Usage: idea-check "your idea description" [--depth quick|deep]
+ */
+import { spawn } from 'node:child_process';
+import { parseArgs } from 'node:util';
+
+const { values, positionals } = parseArgs({
+  options: {
+    depth: { type: 'string', default: 'quick' },
+    help: { type: 'boolean', short: 'h', default: false },
+  },
+  allowPositionals: true,
+  strict: false,
+});
+
+if (values.help || positionals.length === 0) {
+  console.log('Usage: idea-check "your idea" [--depth quick|deep]');
+  process.exit(0);
+}
+
+const ideaText = positionals.join(' ');
+const depth = values.depth;
+
+function sendLine(proc, obj) {
+  proc.stdin.write(JSON.stringify(obj) + '\n');
+}
+
+// Find the idea-reality-mcp binary (installed via uv tool install)
+const mcpBin = '/usr/local/bin/idea-reality-mcp';
+
+const proc = spawn(mcpBin, [], { stdio: ['pipe', 'pipe', 'pipe'] });
+
+let buffer = '', initialized = false, done = false;
+
+proc.stdout.on('data', chunk => {
+  buffer += chunk.toString();
+  const lines = buffer.split('\n');
+  buffer = lines.pop();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.id === 1 && msg.result?.serverInfo && !initialized) {
+      initialized = true;
+      sendLine(proc, { jsonrpc: '2.0', method: 'notifications/initialized' });
+      sendLine(proc, { jsonrpc: '2.0', id: 2, method: 'tools/call',
+        params: { name: 'idea_check', arguments: { idea_text: ideaText, depth } } });
+    }
+    if (msg.id === 2 && !done) {
+      done = true;
+      const text = (msg.result?.content ?? []).map(c => c.text ?? '').join('\n').trim();
+      console.log(text);
+      proc.kill(); process.exit(0);
+    }
+    if (msg.error && !done) {
+      done = true;
+      console.error('MCP error:', msg.error.message);
+      proc.kill(); process.exit(1);
     }
   }
-}
+});
+
+proc.stderr.on('data', d => {
+  const s = d.toString();
+  if (!s.includes('Downloading') && !s.includes('Installed') && !s.includes('Downloaded'))
+    process.stderr.write(s);
+});
+
+proc.on('error', err => { console.error('Failed to start MCP server:', err.message); process.exit(1); });
+proc.on('close', code => { if (!done) { console.error('MCP server exited early (code', code + ')'); process.exit(1); } });
+
+sendLine(proc, { jsonrpc: '2.0', id: 1, method: 'initialize',
+  params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'idea-check-cli', version: '1.0' } } });
+
+setTimeout(() => { if (!done) { console.error('Timeout'); proc.kill(); process.exit(1); } }, 60000);
 ```
 
-3. Add this to your OpenClaw agent instructions:
+### 3. Make idea-reality-mcp accessible to all users
 
-```text
-Before starting any new project, feature, or tool, always run idea_check first.
+```bash
+# Install to a shared location
+UV_TOOL_DIR=/opt/uv-tools uv tool install idea-reality-mcp --force
+# Point /usr/local/bin symlink to the shared install
+ln -sf /opt/uv-tools/idea-reality-mcp/bin/idea-reality-mcp /usr/local/bin/idea-reality-mcp
+```
 
-Rules:
-- If reality_signal > 70: STOP. Report the top 3 competitors with star counts.
-  Ask me if I want to proceed, pivot, or abandon.
-- If reality_signal 30-70: Show me the results and pivot_hints.
-  Suggest a niche angle that existing projects don't cover.
-- If reality_signal < 30: Proceed to build.
-  Mention that the space is open.
-- Always show the reality_signal score and top competitors before writing any code.
+### 4. Add the SKILL.md to your OpenClaw skills directory
+
+Save this as `~/.openclaw/skills/pre-build-idea-validator/SKILL.md`:
+
+```markdown
+---
+name: pre-build-idea-validator
+description: >-
+  Validate an idea before building. Use when starting any new project, feature,
+  or tool before writing any code, or when the user shares a GitHub repo URL and
+  wants to understand its idea or market position.
+---
+
+# Pre-Build Idea Validator
+
+Before starting anything new, check whether it already exists.
+
+## Run it
+
+\`\`\`bash
+node /usr/local/bin/idea-check "describe the idea here"
+\`\`\`
+
+Deep scan:
+\`\`\`bash
+node /usr/local/bin/idea-check "describe the idea here" --depth deep
+\`\`\`
+
+## GitHub repo URL mode
+
+1. Fetch the README to extract a 1-sentence description
+2. Run idea-check with that description
+3. Report reality_signal + what the repo does
+
+## Decision rules
+
+| reality_signal | Action |
+|---|---|
+| > 70 | STOP. Show top 3 competitors with star counts. Ask whether to proceed, pivot, or abandon. |
+| 30–70 | Show results and pivot_hints. Suggest a niche angle existing projects don't cover. |
+| < 30 | Proceed. The space is open. |
+
+Always show the score and top competitors before writing any code.
 ```
 
 ## Real World Example
 
 **You:** "Build me a CLI tool for AI code review"
 
-OpenClaw runs `idea_check("AI code review tool")` and responds:
+OpenClaw runs `idea-check "AI code review tool"` and responds:
 
 > **reality_signal: 90/100 (very high)**
 >
@@ -67,35 +177,14 @@ OpenClaw runs `idea_check("AI code review tool")` and responds:
 > 2. reviewdog — 9,104 stars
 > 3. Danger (Ruby) — 5,649 stars
 >
-> This space has 143,000+ related repos. The top players are mature and well-funded.
->
-> **Pivot suggestions:**
-> - Focus on a specific language (Rust/Go-only AI code review)
-> - Target a specific framework (React/Vue component review)
-> - Target a specific industry (financial/medical code compliance review)
->
-> Should I proceed with a differentiated angle, or pivot to something else?
-
-**You:** "What about an MCP server for pre-build idea validation?"
-
-> **reality_signal: 8/100 (very low)**
->
-> 0 direct competitors found on PyPI or npm. GitHub has some tangentially related repos but none solve this exact problem.
->
-> The space is wide open. Proceeding to build.
-
-## Variations
-
-- **Deep mode for serious decisions**: Use `depth="deep"` to scan all 5 sources in parallel (GitHub + HN + npm + PyPI + Product Hunt) for major project decisions.
-- **Batch validation**: Before a hackathon, give OpenClaw a list of 10 ideas and have it rank them by `reality_signal` — lowest score = most original opportunity.
-- **Web demo first**: Try without installing at [mnemox.ai/check](https://mnemox.ai/check) to see if the workflow fits your needs.
+> Should I proceed with a differentiated angle, or pivot?
 
 ## Key Insights
 
-- This prevents the most expensive mistake in building: **solving a problem that's already been solved**.
-- The `reality_signal` is based on real data (repo counts, star distributions, HN discussion volume), not LLM guessing.
-- A high score doesn't mean "don't build" — it means "differentiate or don't bother."
-- A low score means genuine white space exists. That's where solo builders have the best odds.
+- Prevents the most expensive mistake in building: solving a problem that's already solved
+- `reality_signal` is based on real data (repo counts, star distributions, HN discussion volume)
+- A high score doesn't mean "don't build" — it means "differentiate or don't bother"
+- A low score means genuine white space. That's where solo builders have the best odds
 
 ## Related Links
 
